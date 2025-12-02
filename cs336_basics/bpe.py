@@ -1,3 +1,5 @@
+from collections.abc import Iterable, Iterator
+import json
 import regex as re
 # multiprocessing
 import multiprocessing
@@ -5,6 +7,44 @@ import pathlib
 from tqdm import tqdm
 
 do_print = False
+
+def split_by_special_tokens(text: str, special_tokens: list[str]) -> list[str]:
+    if not special_tokens:
+        return [text]
+    split_pattern = "|".join(re.escape(token) for token in special_tokens)
+    return re.split(split_pattern, text)
+
+def pretokenize_text_with_frequency(text: str) -> dict[tuple[int], int]:
+    PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
+    # use re.finditer
+    pretokenized = [match.group(0) for match in re.finditer(PAT, text)]
+    frequency = {}
+    for token in pretokenized:
+        split_token_by_bytes = tuple([bytes([b]) for b in token.encode("utf-8")])
+        frequency[split_token_by_bytes] = frequency.get(split_token_by_bytes, 0) + 1
+    return frequency
+
+def pretokenize_frequency_multiprocessing(chunks: list[str]) -> dict[tuple[bytes], int]:
+    with multiprocessing.Pool() as pool:
+        results = pool.starmap(pretokenize_text_with_frequency, [(chunk,) for chunk in chunks])
+    # merge all dicts
+    pretokenized_tokens = {}
+    for result in results:
+        for token, freq in result.items():
+            pretokenized_tokens[token] = pretokenized_tokens.get(token, 0) + freq
+    return pretokenized_tokens
+
+# normal pretokenize function without computing frequency
+def pretokenize_text(text: str) -> dict[tuple[bytes], int]:
+    PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
+    pretokenized = [match.group(0) for match in re.finditer(PAT, text)]
+    final_split_token_by_bytes = []
+    for token in pretokenized:
+        split_token_by_bytes = tuple([bytes([b]) for b in token.encode("utf-8")])
+        final_split_token_by_bytes.append(split_token_by_bytes)
+    return final_split_token_by_bytes
+
+
 
 class BPETrainer:
     def __init__(self, input_path: str, vocab_size: int, special_tokens: list[str]):
@@ -26,34 +66,6 @@ class BPETrainer:
             for line in f:
                 out.append(line)
         return "".join(out)
-
-    def split_by_special_tokens(self, text: str, special_tokens: list[str]) -> list[str]:
-        if not special_tokens:
-            return [text]
-        split_pattern = "|".join(re.escape(token) for token in special_tokens)
-        return re.split(split_pattern, text)
-
-    # Pretokenization function using the regex pattern provided in the assignment description. Return example:  {(108, 111, 119): 5 ...}
-    def pretokenize_text(self, text: str, special_tokens: list[str]) -> dict[tuple[int], int]:
-        PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
-        # use re.finditer
-        pretokenized = [match.group(0) for match in re.finditer(PAT, text)]
-        frequency = {}
-        for token in pretokenized:
-            split_token_by_bytes = tuple([bytes([b]) for b in token.encode("utf-8")])
-            frequency[split_token_by_bytes] = frequency.get(split_token_by_bytes, 0) + 1
-
-        return frequency
-
-    def pretokenize_multiprocessing(self, chunks: list[str], special_tokens: list[str]) -> dict[tuple[bytes], int]:
-        with multiprocessing.Pool() as pool:
-            results = pool.starmap(self.pretokenize_text, [(chunk, special_tokens) for chunk in chunks])
-        # merge all dicts
-        pretokenized_tokens = {}
-        for result in results:
-            for token, freq in result.items():
-                pretokenized_tokens[token] = pretokenized_tokens.get(token, 0) + freq
-        self.pretokenized_tokens =  pretokenized_tokens
 
     def merge_pairs(self, vocab_size: int, pairs_bytes: dict[tuple[bytes], int] | None = None) -> tuple[bytes, bytes] | None:        
         most_frequent_pair = None
@@ -143,10 +155,10 @@ class BPETrainer:
         text = self.read_file_stream(input_path)
         print("File read complete. Length:", len(text))
         print("Splitting by special tokens...")
-        chunks = self.split_by_special_tokens(text, special_tokens)
+        chunks = split_by_special_tokens(text, special_tokens)
         print("Splitting complete. Number of chunks:", len(chunks))
         print("Pretokenizing with multiprocessing...")
-        self.pretokenize_multiprocessing(chunks, special_tokens)
+        self.pretokenized_tokens = pretokenize_frequency_multiprocessing(chunks)
         print("Pretokenization complete. Number of unique pretokenized tokens:", len(self.pretokenized_tokens)) # pretokenized_tokens
         # Initialize vocab with single byte tokens
         vocab = {}
@@ -175,16 +187,166 @@ class BPETrainer:
                 count += 1
         return self.vocab, merges
 
+
+
+class Tokenizer:
+    def __init__(self, vocab: dict[int, bytes], merges: list[tuple[bytes, bytes]], special_tokens: list[str] | None = None):
+        self.vocab = vocab
+        self.merges = merges
+        self.special_tokens = special_tokens 
+
+    @classmethod
+    def from_files(cls, vocab_filepath:str, merges_filepath:str, special_tokens: list[str] | None = None):
+        """
+        Class method that constructs and returns a Tokenizer from a serialized vocabulary and list of merges
+        (in the same format that your BPE training code output) and (optionally) a list of special
+        tokens. This method should accept the following additional parameters:
+        """
+        import json
+        with open(vocab_filepath, "r") as f:
+            vocab_json = json.load(f)
+        
+        vocab = {}
+        for token_str, token_id in vocab_json.items():
+            vocab[token_id] = token_str.encode("utf-8")
+
+        # Read merges from text file
+        # Format: each line is "token1 token2"
+        merges = []
+        with open(merges_filepath, "r") as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    parts = line.split(" ", 1)
+                    if len(parts) == 2:
+                        first = parts[0].encode("utf-8")
+                        second = parts[1].encode("utf-8")
+                        merges.append((first, second))
+
+        return cls(vocab, merges, special_tokens)
+
+    def encode(self, text: str) -> list[int]:
+        """
+        Encode an input text into a sequence of token IDs.
+        """
+        # cache token tuple to token id
+        token_tuple_token_ids = {}
+        reverse_vocab = {v: k for k, v in self.vocab.items()}
+        # pretokenize each chunk
+        pretokenized_tokens = pretokenize_text(text)
+        # apply merges in same order as in self.merges.
+        token_ids = []
+        print("pretokenized_tokens:", pretokenized_tokens)
+        for token_tuple in pretokenized_tokens:
+            print("########## Token tuple before merges:", token_tuple)
+            if token_tuple in token_tuple_token_ids:
+                token_ids.extend(token_tuple_token_ids[token_tuple])
+                continue
+            
+            original_token_tuple = token_tuple
+            for merge in self.merges:
+                new_token_list = []
+                i = 0
+                while i < len(token_tuple):
+                    if i < len(token_tuple) - 1 and (token_tuple[i], token_tuple[i+1]) == merge:
+                        new_token_list.append(token_tuple[i] + token_tuple[i+1])
+                        i += 2
+                        print("Applied merge:", merge)
+                    else:
+                        new_token_list.append(token_tuple[i])
+                        i += 1
+                token_tuple = tuple(new_token_list)
+            current_token_ids = []
+            for token in token_tuple:
+                print("Token:", token)
+                if token in reverse_vocab:
+                    current_token_ids.append(reverse_vocab[token])
+                else:
+                    raise ValueError(f"Token {token} not in vocabulary.")
+            token_tuple_token_ids[original_token_tuple] = current_token_ids
+            token_ids.extend(current_token_ids)
+            print("########## Token tuple after merges:", token_tuple, token_ids)
+        return token_ids
+         
+
+    def encode_iterable(self, iterable: Iterable[str]) -> Iterator[int]:
+        """
+        Given an iterable of
+        strings (e.g., a Python file handle), return a generator that lazily yields token IDs. This is
+        required for memory-eﬀicient tokenization of large files that we cannot directly load into
+        memory.
+        """
+        # cache token tuple to token id
+        token_tuple_token_ids = {}
+        reverse_vocab = {v: k for k, v in self.vocab.items()}
+        # get next string from iterable
+        for text in iterable:
+            pretokenized_tokens = pretokenize_text(text)
+            for token_tuple in pretokenized_tokens:
+                if token_tuple in token_tuple_token_ids:
+                    for token_id in token_tuple_token_ids[token_tuple]:
+                        yield token_id
+                    continue
+
+                original_token_tuple = token_tuple
+                for merge in self.merges:
+                    new_token_list = []
+                    i = 0
+                    while i < len(token_tuple):
+                        if i < len(token_tuple) - 1 and (token_tuple[i], token_tuple[i+1]) == merge:
+                            new_token_list.append(token_tuple[i] + token_tuple[i+1])
+                            i += 2
+                        else:
+                            new_token_list.append(token_tuple[i])
+                            i += 1
+                    token_tuple = tuple(new_token_list)
+                current_token_ids = []
+                for token in token_tuple:
+                    if token in reverse_vocab:
+                        current_token_ids.append(reverse_vocab[token])
+                    else:
+                        raise ValueError(f"Token {token} not in vocabulary.")
+                token_tuple_token_ids[original_token_tuple] = current_token_ids
+                for token_id in current_token_ids:
+                    yield token_id
+
+    def decode(self, ids: list[int]) -> str:
+        """
+        Decode a sequence of token IDs into text.
+        """
+        try:
+            return "".join([self.vocab[token_id].decode("utf-8") for token_id in ids])
+        except KeyError:
+            raise ValueError(f"Token IDs not in vocabulary.")
+
 if __name__ == '__main__':
 
-    input_path = "./data/TinyStoriesV2-GPT4-train.txt"
-    vocab_size = 10000
-    special_tokens = ["<|endoftext|>"]
-    trainer = BPETrainer(input_path, vocab_size, special_tokens)
-    vocab, merges = trainer.train_bpe(
-        input_path=input_path,
-        vocab_size=vocab_size,
-        special_tokens=special_tokens,
-    )
-    print("Final Vocab size:", len(vocab))
-    print("Final Merges size:", len(merges))
+    # input_path = "./data/TinyStoriesV2-GPT4-valid.txt"
+    # vocab_size = 10000
+    # special_tokens = ["<|endoftext|>"]
+    # trainer = BPETrainer(input_path, vocab_size, special_tokens)
+    # vocab, merges = trainer.train_bpe(
+    #     input_path=input_path,
+    #     vocab_size=vocab_size,
+    #     special_tokens=special_tokens,
+    # )
+    # print("Final Vocab size:", len(vocab))
+    # print("Final Merges size:", len(merges))
+
+
+    # # test Tokenizer.from_files
+    # FIXTURES_PATH = "/Users/pshettiw/Documents/Courses/CS336/BPETokenizer/tests/fixtures"
+    # VOCAB_PATH = FIXTURES_PATH + "/gpt2_vocab.json"
+    # MERGES_PATH = FIXTURES_PATH + "/gpt2_merges.txt"
+    # tokenizer = Tokenizer.from_files(VOCAB_PATH, MERGES_PATH, special_tokens=["<|endoftext|>"])
+    # print("Tokenizer loaded from files.")
+    # print("Vocab size:", len(tokenizer.vocab))
+    # print("First 10 vocab items:", list(tokenizer.vocab.items())[:10])
+    # print("Merges size:", len(tokenizer.merges))
+    # print("First 10 merges:", tokenizer.merges[:10])
+
+
+    # text = "s"
+    # token_ids = tokenizer.encode(text)
+    # print("Encoded token IDs for text:", text)
+    # print(token_ids)
